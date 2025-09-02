@@ -156,7 +156,7 @@ class FilepondService
         // Check if the full file has been uploaded
         if ($currentSize >= $uploadLength) {
             Log::debug("File upload complete on SFTP: {$remotePath}");
-            $mimeType = (new MimeTypes())->guessMimeType($uploadName);
+            $mimeType = (new MimeTypes())->getMimeTypes(pathinfo($uploadName, PATHINFO_EXTENSION))[0] ?? 'application/octet-stream';
             // Update filepond record
             $filepond->update([
                 'filepath' => str_replace(env('SFTP_ROOT'), '', $remotePath), // Save relative path
