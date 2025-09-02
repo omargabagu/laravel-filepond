@@ -31,7 +31,7 @@ class FilepondService
     {
         $this->disk = config('filepond.disk', 'public');
         $this->tempDisk = config('filepond.temp_disk', 'local');
-        $this->tempFolder = config('filepond.temp_folder', 'filepond/temp');
+        $this->tempFolder = config('filepond.temp_folder', '/temp');
         $this->model = config('filepond.model', Filepond::class);
     }
 
@@ -110,6 +110,7 @@ class FilepondService
      *
      * @throws Throwable
      */
+
     public function chunk(Request $request)
     {
         $id = Crypt::decrypt($request->patch)['id'];
@@ -121,7 +122,7 @@ class FilepondService
         $chunkContent = $request->getContent();
         $chunkSize = strlen($chunkContent);
 
-        Log::debug("Streaming chunk to SFTP: {$uploadName} (offset: {$uploadOffset}, size: {$chunkSize})");
+        Log::debug("Received chunk: {$uploadName} (offset: {$uploadOffset}, size: {$chunkSize})");
 
         // Validate chunk size
         $contentLength = (int) $request->header('Content-Length');
@@ -130,47 +131,100 @@ class FilepondService
             throw new InvalidChunkException;
         }
 
-        // Connect to SFTP via phpseclib
-        $sftp = new SFTP(env('SFTP_HOST'), (int) env('SFTP_PORT', 22));
-        if (!$sftp->login(env('SFTP_USERNAME'), env('SFTP_PASSWORD'))) {
-            throw new \RuntimeException('SFTP Login Failed');
+        if ($this->disk === 'sftp') {
+            // SFTP streaming approach
+
+            // Connect to SFTP via phpseclib
+            $sftp = new SFTP(env('SFTP_HOST'), (int) env('SFTP_PORT', 22));
+            if (!$sftp->login(env('SFTP_USERNAME'), env('SFTP_PASSWORD'))) {
+                throw new \RuntimeException('SFTP Login Failed');
+            }
+
+            $remotePath = env('SFTP_ROOT', '') . "/temp/{$id}/{$uploadName}";
+
+            // Ensure parent directory exists
+            $dir = dirname($remotePath);
+            if (!$sftp->file_exists($dir)) {
+                $sftp->mkdir($dir, -1, true); // recursive mkdir
+            }
+
+            // Write chunk directly at offset
+            if (!$sftp->put($remotePath, $chunkContent, SFTP::SOURCE_STRING, $uploadOffset)) {
+                Log::error("Failed to write chunk to remote path: {$remotePath} at offset {$uploadOffset}");
+                throw new \RuntimeException("Failed to write chunk to SFTP");
+            }
+
+            // Get current file size on remote
+            $currentSize = $sftp->filesize($remotePath);
+
+            if ($currentSize >= $uploadLength) {
+                Log::debug("File upload complete on SFTP: {$remotePath}");
+                $mimeType = (new MimeTypes())->getMimeTypes(pathinfo($uploadName, PATHINFO_EXTENSION))[0] ?? 'application/octet-stream';
+
+                $filepond->update([
+                    'filepath' => str_replace(env('SFTP_ROOT'), '', $remotePath), 
+                    'filename' => $uploadName,
+                    'extension' => pathinfo($uploadName, PATHINFO_EXTENSION),
+                    'mimetypes' => $mimeType,
+                    'disk' => 'sftp',
+                    'created_by' => auth()->id(),
+                    'expires_at' => now()->addMinutes(config('filepond.expiration', 30)),
+                ]);
+            }
+
+            return $currentSize;
+
+        } else {
+            // Local disk chunk save and merge approach
+
+            $dir = Storage::disk($this->tempDisk)->path($this->tempFolder.'/'.$id.'/');
+
+            $chunkFilePath = $dir . $uploadOffset;
+
+            $written = file_put_contents($chunkFilePath, $chunkContent);
+
+            if ($written === false || $written === 0 || $written !== $chunkSize) {
+                unlink($chunkFilePath);
+                throw new InvalidChunkException;
+            }
+
+            // Sum all chunk sizes to check if full file uploaded
+            $size = 0;
+            $chunks = glob($dir . '*');
+            foreach ($chunks as $chunk) {
+                $size += filesize($chunk);
+            }
+
+            if ($size === $uploadLength) {
+                // Merge chunks into final file
+                $file = fopen($dir . $uploadName, 'w');
+                foreach ($chunks as $chunk) {
+                    $offset = (int) basename($chunk);
+                    $chunkData = file_get_contents($chunk);
+                    fseek($file, $offset);
+                    fwrite($file, $chunkData);
+                    unlink($chunk);
+                }
+                fclose($file);
+
+                $mimeType = Storage::disk($this->tempDisk)->mimeType($this->tempFolder.'/'.$id.'/'.$uploadName);
+
+                $filepond->update([
+                    'filepath' => $this->tempFolder.'/'.$id.'/'.$uploadName,
+                    'filename' => $uploadName,
+                    'extension' => pathinfo($uploadName, PATHINFO_EXTENSION),
+                    'mimetypes' => $mimeType,
+                    'disk' => $this->disk,
+                    'created_by' => auth()->id(),
+                    'expires_at' => now()->addMinutes(config('filepond.expiration', 30)),
+                ]);
+        
+            }
+
+            return $size;
         }
-
-        $remotePath = env('SFTP_ROOT', '/omar_dir') . "/filepond/{$id}/{$uploadName}";
-
-        // Ensure parent directory exists
-        $dir = dirname($remotePath);
-        if (!$sftp->file_exists($dir)) {
-            $sftp->mkdir($dir, -1, true); // recursive mkdir
-        }
-
-        // Open remote file for writing (create if it doesn’t exist)
-        if (!$sftp->put($remotePath, $chunkContent, SFTP::SOURCE_STRING, $uploadOffset)) {
-            Log::error("Failed to write chunk to remote path: {$remotePath} at offset {$uploadOffset}");
-            throw new \RuntimeException("Failed to write chunk to SFTP");
-        }
-
-        // Keep track of current uploaded size
-        $currentSize = $sftp->filesize($remotePath);
-
-        // Check if the full file has been uploaded
-        if ($currentSize >= $uploadLength) {
-            Log::debug("File upload complete on SFTP: {$remotePath}");
-            $mimeType = (new MimeTypes())->getMimeTypes(pathinfo($uploadName, PATHINFO_EXTENSION))[0] ?? 'application/octet-stream';
-            // Update filepond record
-            $filepond->update([
-                'filepath' => str_replace(env('SFTP_ROOT'), '', $remotePath), // Save relative path
-                'filename' => $uploadName,
-                'extension' => pathinfo($uploadName, PATHINFO_EXTENSION),
-                'mimetypes' => $mimeType, // Optional: phpseclib doesn't have mimetype detection by default
-                'disk' => 'sftp',
-                'created_by' => auth()->id(),
-                'expires_at' => now()->addMinutes(config('filepond.expiration', 30)),
-            ]);
-        }
-
-        return $currentSize;
     }
+
 
     /**
      * Get the offset of the last uploaded chunk for resume
