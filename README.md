@@ -18,6 +18,15 @@ Support the development with a :star: to let others know it worked for you.
 
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/W7W2I1JIV)
 
+**Dependencies**
+```bash
+composer require symfony/mime
+composer require phpseclib/phpseclib
+```
+***php.ini***
+```bash
+extension=fileinfo
+```
 **Demo Projects**
 
 - [Laravel-filepond-vue-inertia-example](https://github.com/rahulhaque/laravel-filepond-vue-inertia-example)
